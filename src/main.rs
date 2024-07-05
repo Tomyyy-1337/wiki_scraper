@@ -1,8 +1,8 @@
-use std::{collections::HashSet, fs};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, io::{Read, Write}, primitive};
 use indicatif::ParallelProgressIterator;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
 use reqwest;
-use clap::Parser;
+use clap::{builder::Str, Parser};
 
 mod terminal_interface;
 
@@ -11,11 +11,112 @@ fn main() {
 
     rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global().unwrap();
 
-    if let Some(url) = args.scan_url {
+    if let Some(url) = args.load_url {
         let max_depth = args.max_depth;
         println!("Scanning: {} with max depth: {} and {} threads", url, max_depth, args.threads);
         parallel_list(&url, max_depth);
+    } else if let Some(name) = args.shortest_path {
+        let path = format!("data/{}/", name);
+        let graph = Graph::from_path(&path);
+
+        println!("Graph mit {} Nodes und {} Kanten geladen", graph.vertices.len(), graph.edges.iter().map(|(_, v)| v.len()).sum::<usize>());
+
+        loop {
+            print!("Start: ");
+            std::io::stdout().flush().unwrap();
+            let mut start_buffer = String::new();
+            let start = std::io::stdin().read_line(&mut start_buffer).unwrap();
+
+            if graph.vertices.iter().find(|&v| v == start_buffer.trim()).is_none() {
+                println!("Vertex not found");
+                continue;
+            }
+            
+            print!("End: ");
+            std::io::stdout().flush().unwrap();
+            let mut end_buffer = String::new();
+            let end = std::io::stdin().read_line(&mut end_buffer).unwrap();
+
+            if graph.vertices.iter().find(|&v| v == end_buffer.trim()).is_none() {
+                println!("Vertex not found");
+                continue;
+            }
+            
+            println!("Path: {:?}", graph.path(start_buffer.trim(), end_buffer.trim()));
+        }
     } 
+        
+    
+}
+
+struct Graph {
+    vertices: Vec<String>,
+    edges: HashMap<usize, HashSet<usize>>,
+}
+
+impl Graph {
+    fn from_path(path: &str) -> Self {
+        let vertices = fs::read_to_string(format!("{}/vertices.txt", path))
+            .unwrap()
+            .split("\n")
+            .par_bridge()
+            .map(|s| s.to_owned())
+            .collect::<Vec<_>>();
+        
+        let index_map = vertices.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect::<HashMap<_, _>>();
+
+        let edges = fs::read_to_string(format!("{}/edges.txt", path))
+            .unwrap()
+            .lines()
+            .par_bridge()
+            .map(|s| { 
+                let mut split = s.split(": ");
+                let url = split.next().unwrap();
+                (index_map[url], split.next().unwrap().split(", ").filter_map(|link| index_map.get(link).cloned()).collect())
+            })
+            .collect::<HashMap<_,_>>();
+        
+        Self {
+            vertices,
+            edges,
+        }                
+    }
+
+    fn path(&self, start: &str, end: &str) -> Vec<String> {
+        let start_index = self.vertices.iter().position(|v| v == start).unwrap();
+        let end_index = self.vertices.iter().position(|v| v == end).unwrap();
+
+        let mut queue = VecDeque::new();
+        queue.push_back((start_index, vec![start_index]));
+        let mut visited = HashSet::new();
+
+        while let Some((index, distance)) = queue.pop_front() {
+            if index == end_index {
+                return distance.iter().map(|&i| self.vertices.get(i).cloned().unwrap()).collect();
+            }
+
+            visited.insert(index);
+
+            let children = self.edges.get(&index).unwrap();
+            for child in children {
+                if visited.contains(child) {
+                    continue;
+                }
+                queue.push_back((*child, distance.iter().cloned().chain(std::iter::once(*child)).collect()));
+            }
+        }
+        Vec::new()
+    }
+
+    fn get_children(&self, s: &str) -> Vec<usize> {
+        let index = self.vertices.iter().position(|v| v == s).unwrap();
+        self.edges.get(&index).map(|links| links.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    fn get_parents(&self, s: &str) -> Vec<usize> {
+        let index = self.vertices.iter().position(|v| v == s).unwrap();
+        self.edges.iter().filter_map(|(i, links)| if links.contains(&index) { Some(*i) } else { None }).collect()
+    }
 }
 
 fn parallel_list(url: &str, max_depth: usize) {
